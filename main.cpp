@@ -1,6 +1,21 @@
 #include "y4m_reader.h"
 #include <cassert>
+#include <future>
 #include <iostream>
+
+YUVFrame get_transformed_frame(YUVFile const &orig, unsigned index) {
+  auto new_width = orig.frames();
+  if (new_width % 2)
+    new_width -= 1;
+  auto new_height = orig.height();
+
+  YUVFrame frame{new_width, new_height};
+  for (auto j = 0u; j < new_height; j++)
+    for (auto k = 0u; k < new_width; k++)
+      frame.pixel(k, j) = orig[k].pixel(index, j);
+
+  return frame;
+}
 
 // Swaps time and horizantal dimesions of
 // yuv coded videofile.
@@ -13,12 +28,15 @@ YUVFile swap_dims(YUVFile const &file) {
 
   YUVFile ret{new_width, new_height};
 
+  std::vector<std::future<YUVFrame>> frameTransforms;
+
   for (auto i = 0u; i < new_frames; ++i) {
-    YUVFrame frame{new_width, new_height};
-    for (auto j = 0u; j < new_height; j++)
-      for (auto k = 0u; k < new_width; k++)
-        frame.pixel(k, j) = file[k].pixel(i, k);
-    ret.add_frame(std::move(frame));
+    frameTransforms.emplace_back(std::async(
+        std::launch::async, &get_transformed_frame, std::ref(file), i));
+  }
+
+  for (auto i = 0u; i < new_frames; ++i) {
+    ret.add_frame(std::move(frameTransforms.at(i).get()));
   }
 
   return ret;

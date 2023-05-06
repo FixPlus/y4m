@@ -1,4 +1,6 @@
 #include "y4m_reader.h"
+#include <future>
+#include <iostream>
 
 YUVFrame::YUVFrame(unsigned width, unsigned height)
     : m_width(width), m_height(height) {
@@ -17,6 +19,27 @@ YUV const &YUVFrame::pixel(unsigned x, unsigned y) const {
   return m_data[y * m_width + x];
 }
 
+namespace {
+
+YUVFrame decode_frame(std::span<char> rawdata, unsigned width,
+                      unsigned height) {
+  YUVFrame frame{width, height};
+  auto u_offset = width * height;
+  auto v_offset = u_offset + (width * height) / 4;
+  for (auto j = 0ull; j < height; ++j)
+    for (auto k = 0ull; k < width; ++k) {
+      YUV pixel;
+      // Read pixel from y u v planes.
+      pixel.y = rawdata[j * width + k];
+      pixel.u = rawdata[u_offset + (j / 2) * width / 2 + (k / 2)];
+      pixel.v = rawdata[v_offset + (j / 2) * width / 2 + (k / 2)];
+      frame.pixel(k, j) = pixel;
+    }
+
+  return frame;
+}
+
+} // namespace
 YUVFile::YUVFile(std::vector<char> &&rawdata, unsigned width, unsigned height)
     : m_width(width), m_height(height) {
   unsigned long long frame_size = (width * height * 3) / 2;
@@ -25,22 +48,44 @@ YUVFile::YUVFile(std::vector<char> &&rawdata, unsigned width, unsigned height)
   auto frames = rawdata.size() / frame_size;
   auto u_offset = width * height;
   auto v_offset = u_offset + (width * height) / 4;
+  // Decode frame asyncronously.
+  std::vector<std::future<YUVFrame>> decodedFrames;
   for (auto i = 0ull; i < frames; i++) {
-    auto &cur_frame = m_data.emplace_back(width, height);
     auto frame_offset = i * frame_size;
-    for (auto j = 0ull; j < height; ++j)
-      for (auto k = 0ull; k < width; ++k) {
-        YUV pixel;
-        // Read pixel from y u v planes.
-        pixel.y = rawdata.at(frame_offset + j * width + k);
-        pixel.u =
-            rawdata.at(frame_offset + u_offset + (j / 2) * width / 2 + (k / 2));
-        pixel.v =
-            rawdata.at(frame_offset + v_offset + (j / 2) * width / 2 + (k / 2));
-        cur_frame.pixel(k, j) = pixel;
-      }
+    decodedFrames.emplace_back(
+        std::async(std::launch::async, &decode_frame,
+                   std::span<char>{rawdata.data() + frame_offset, frame_size},
+                   width, height));
+  }
+
+  for (auto &decoded : decodedFrames) {
+    m_data.emplace_back(decoded.get());
   }
 }
+
+namespace {
+
+void encode_planes(YUVFrame const &frame, std::span<char> buffer) {
+  if (buffer.size() != (frame.width() * frame.height() * 3) / 2)
+    throw std::runtime_error("encode_planes() got wrong buffer size");
+
+  auto u_offset = frame.width() * frame.height();
+  auto v_offset = u_offset + (frame.width() * frame.height()) / 4;
+
+  for (int i = 0u; i < frame.height(); ++i)
+    for (int j = 0u; j < frame.width(); ++j) {
+      auto pix = frame.pixel(j, i);
+      // encode pixel to planes.
+      // u and v are subsampled.
+      // For simplicity only one sample of 4 uv samples
+      // is considered.
+      buffer[i * frame.width() + j] = pix.y;
+      buffer[u_offset + (i / 2) * frame.width() / 2 + j / 2] = pix.u;
+      buffer[v_offset + (i / 2) * frame.width() / 2 + j / 2] = pix.v;
+    }
+}
+
+} // namespace
 std::vector<char> YUVFrame::encode_planes() const {
   std::vector<char> encoded;
   encoded.resize((width() * height() * 3) / 2);
@@ -188,10 +233,20 @@ void Y4MReader::save(YUVFile &video, std::filesystem::path filename) {
     throw std::runtime_error("Error outputing to file.");
 
   // Encode frames.
+  std::vector<char> buffer;
+  auto frame_size = (video.width() * video.height() * 3) / 2;
+  buffer.resize(video.frames() * frame_size);
+  std::vector<std::future<void>> codedFrames;
+  for (auto i = 0u; i < video.frames(); ++i) {
+    codedFrames.emplace_back(std::async(
+        std::launch::async, &encode_planes, std::ref(video[i]),
+        std::span<char>{buffer.data() + i * frame_size, frame_size}));
+  }
+
   for (auto i = 0u; i < video.frames(); ++i) {
     file << "FRAME" << std::endl;
-    auto frame_data = video[i].encode_planes();
-    file.write(frame_data.data(), frame_data.size());
+    codedFrames.at(i).get();
+    file.write(buffer.data() + i * frame_size, frame_size);
 
     if (!file)
       throw std::runtime_error("Error outputing to file.");
